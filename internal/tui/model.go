@@ -1,15 +1,15 @@
-package main
+package tui
 
 import (
-	"crypto/rand"
 	"fmt"
-	"log"
+	"os"
+	"os/exec"
+	"run-out-mem/internal/allocator"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
-	"syscall"
 	"time"
-	"unsafe"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -17,7 +17,6 @@ import (
 
 const (
 	chunkSize = 512 * 1024 * 1024 // 512MB in bytes
-	pageSize  = 4096              // 4KB page size
 )
 
 type state int
@@ -41,14 +40,25 @@ type model struct {
 	cursor         int
 	touchStopChan  chan bool
 	touchWg        sync.WaitGroup
+
+	// Swap monitoring fields
+	lastSwapIn    uint64
+	lastSwapOut   uint64
+	swapReadRate  float64 // MB/s
+	swapWriteRate float64 // MB/s
 }
 
 type tickMsg time.Time
 type allocateMsg struct{}
 type errorMsg string
+type swapMonitorMsg struct{}
+type swapStatMsg struct {
+	swapIn  uint64
+	swapOut uint64
+}
 
-// Initial model
-func initialModel() model {
+// NewInitialModel creates the initial model for the TUI
+func NewInitialModel() model {
 	return model{
 		state:         stateInput,
 		input:         "",
@@ -91,6 +101,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateError
 		m.errorMsg = string(msg)
 		return m, nil
+
+	case swapMonitorMsg:
+		if m.state == stateAllocating || m.state == stateDone {
+			return m, querySwapStats()
+		}
+		return m, nil
+
+	case swapStatMsg:
+		pageSizeMB := float64(os.Getpagesize()) / (1024 * 1024)
+
+		if m.lastSwapIn > 0 { // Avoid initial spike on first data point
+			deltaIn := msg.swapIn - m.lastSwapIn
+			m.swapReadRate = float64(deltaIn) * pageSizeMB
+		}
+		if m.lastSwapOut > 0 {
+			deltaOut := msg.swapOut - m.lastSwapOut
+			m.swapWriteRate = float64(deltaOut) * pageSizeMB
+		}
+
+		m.lastSwapIn = msg.swapIn
+		m.lastSwapOut = msg.swapOut
+
+		return m, monitorSwap() // Schedule the next check
 	}
 
 	return m, nil
@@ -121,6 +154,7 @@ func (m model) handleInputState(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(
 			tickCmd(),
 			func() tea.Msg { return allocateMsg{} },
+			querySwapStats(), // Start monitoring
 		)
 
 	case "backspace":
@@ -155,7 +189,7 @@ func (m model) handleDoneState(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "r":
 		// Reset
-		return initialModel(), nil
+		return NewInitialModel(), nil
 	}
 	return m, nil
 }
@@ -179,7 +213,7 @@ func (m model) handleAllocateMsg() (tea.Model, tea.Cmd) {
 	}
 
 	// Allocate memory and force physical allocation
-	chunk, err := allocatePhysicalMemory(int(allocSize))
+	chunk, err := allocator.AllocatePhysicalMemory(int(allocSize))
 	if err != nil {
 		return m, func() tea.Msg {
 			return errorMsg(fmt.Sprintf("内存分配失败: %v", err))
@@ -205,6 +239,48 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+func monitorSwap() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return swapMonitorMsg{}
+	})
+}
+
+func querySwapStats() tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command("vm_stat")
+		output, err := cmd.Output()
+		if err != nil {
+			return errorMsg(fmt.Sprintf("failed to get swap stats: %v", err))
+		}
+
+		lines := strings.Split(string(output), "\n")
+		var pageins, pageouts uint64
+
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.Contains(line, "Pageins:") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					val := strings.TrimSuffix(parts[1], ".")
+					if parsed, err := strconv.ParseUint(val, 10, 64); err == nil {
+						pageins = parsed
+					}
+				}
+			} else if strings.Contains(line, "Pageouts:") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					val := strings.TrimSuffix(parts[1], ".")
+					if parsed, err := strconv.ParseUint(val, 10, 64); err == nil {
+						pageouts = parsed
+					}
+				}
+			}
+		}
+
+		return swapStatMsg{swapIn: pageins, swapOut: pageouts}
+	}
 }
 
 // View renders the interface
@@ -253,6 +329,10 @@ func (m model) View() string {
 		s += fmt.Sprintf("已分配: %.2f GB\n", allocatedGB)
 		s += fmt.Sprintf("内存块数量: %d\n", len(m.memoryChunks))
 		s += fmt.Sprintf("用时: %v\n", elapsed.Truncate(time.Millisecond*10))
+		s += "\n"
+		s += fmt.Sprintf("Swap In: %.2f MB/s\n", m.swapReadRate)
+		s += fmt.Sprintf("Swap Out: %.2f MB/s\n", m.swapWriteRate)
+		s += "\n"
 
 		// Show memory stats
 		var mem runtime.MemStats
@@ -273,6 +353,10 @@ func (m model) View() string {
 		s += fmt.Sprintf("实际分配: %.2f GB\n", allocatedGB)
 		s += fmt.Sprintf("内存块数量: %d\n", len(m.memoryChunks))
 		s += fmt.Sprintf("总用时: %v\n", elapsed.Truncate(time.Millisecond*10))
+		s += "\n"
+		s += fmt.Sprintf("Swap In: %.2f MB/s\n", m.swapReadRate)
+		s += fmt.Sprintf("Swap Out: %.2f MB/s\n", m.swapWriteRate)
+		s += "\n"
 
 		// Show final memory stats
 		var mem runtime.MemStats
@@ -303,45 +387,6 @@ func (m *model) stopMemoryTouching() {
 	default:
 	}
 	m.touchWg.Wait()
-}
-
-// allocatePhysicalMemory allocates memory and forces physical allocation
-func allocatePhysicalMemory(size int) ([]byte, error) {
-	// Allocate the memory
-	chunk := make([]byte, size)
-
-	// Fill with random data to prevent compression and deduplication
-	if _, err := rand.Read(chunk); err != nil {
-		// Fallback: fill with varying patterns
-		for i := 0; i < size; i++ {
-			chunk[i] = byte(i % 256)
-		}
-	}
-
-	// Force allocation of physical memory by writing to every page
-	for i := 0; i < size; i += pageSize {
-		// Write to the beginning of each page
-		chunk[i] = byte((i / pageSize) % 256)
-
-		// Write to middle of page if it exists
-		if i+pageSize/2 < size {
-			chunk[i+pageSize/2] = byte(((i / pageSize) + 128) % 256)
-		}
-
-		// Write to end of page if it exists
-		if i+pageSize-1 < size {
-			chunk[i+pageSize-1] = byte(((i / pageSize) + 255) % 256)
-		}
-	}
-
-	// Try to lock memory to prevent swapping (may fail without privileges)
-	ptr := uintptr(unsafe.Pointer(&chunk[0]))
-	syscall.Syscall(syscall.SYS_MLOCK, ptr, uintptr(size), 0)
-
-	// Force memory barrier to ensure all writes are committed
-	runtime.KeepAlive(chunk)
-
-	return chunk, nil
 }
 
 // touchMemoryPeriodically continuously accesses memory to prevent swapping
@@ -375,19 +420,12 @@ func (m *model) touchMemoryPeriodically() {
 				}
 
 				// Also access page boundaries to ensure pages stay resident
-				for pageStart := 0; pageStart < len(chunk); pageStart += pageSize * 100 { // Every 100 pages
+				for pageStart := 0; pageStart < len(chunk); pageStart += allocator.PageSize * 100 { // Every 100 pages
 					if pageStart < len(chunk) {
 						chunk[pageStart] = chunk[pageStart] ^ 0x01
 					}
 				}
 			}
 		}
-	}
-}
-
-func main() {
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		log.Fatal(err)
 	}
 }

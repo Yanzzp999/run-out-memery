@@ -1,4 +1,4 @@
 build:
-	go build -o memory-eater main.go
+	go build -o memory-eater cmd/memory-eater/main.go
 
 .PHONY: build
